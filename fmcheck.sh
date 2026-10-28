@@ -12,6 +12,8 @@
 #     list of hosted file names. Fix is the server-level "Filter Databases in
 #     Client Applications" setting - there is no WebDirect-specific setting.
 #   - GUEST / anonymous access per file, over the Data API AND OData.
+#   - XML CWP -dbnames in both grammars (fmresultset.xml, FMPXMLRESULT.xml):
+#     flags any file names returned without login.
 #   - Which FileMaker web interfaces answer publicly (OData, XML CWP,
 #     WebDirect, Admin Console :16000).
 #   - TLS certificate expiry.
@@ -224,7 +226,6 @@ audit_host() {
   # getthumb thumbnail; the sign-in-first page has neither.
   WD_FILES=$(grep -oE 'iwp_db@[0-9]x\.png|fms-command=getthumb' "$TMP" 2>/dev/null | grep -c .)
   grep -q 'Client must provide account information' "$TMP" 2>/dev/null && WD_LOGIN=1 || WD_LOGIN=0
-  C_XML=$(code_get "https://$H/fmi/xml/fmresultset.xml?-dbnames")
   C_ADMIN443=$(code_get "https://$H/admin-console/")
   C_ADMIN16=$(code_get "https://$H:$ADMIN_PORT/admin-console/")
 
@@ -240,11 +241,26 @@ audit_host() {
     echo "  [INFO] WebDirect  : reachable (HTTP $C_WEBD) - page not recognised, check in a browser"
   fi
 
-  if reachable "$C_XML"; then
-    echo "  [WARN] XML CWP    : reachable (HTTP $C_XML) - review & disable if unused (CVE-2026-86934)"
-  else
-    echo "  [OK]   XML CWP    : not reachable"
-  fi
+  # XML Custom Web Publishing: try -dbnames in BOTH grammars and read the reply.
+  # fmresultset.xml returns names in <data>, FMPXMLRESULT.xml in <DATA>.
+  XML_ANY=0
+  for GRAM in fmresultset FMPXMLRESULT; do
+    XURL="https://$H/fmi/xml/$GRAM.xml?-dbnames"
+    XCODE=$(curl -sk -o "$TMP" -w '%{http_code}' --max-time "$TIMEOUT" "$XURL" 2>/dev/null)
+    reachable "$XCODE" || continue
+    XML_ANY=1
+    XNAMES=$(grep -oiE '<data>[^<]*</data>' "$TMP" 2>/dev/null \
+             | sed -E 's/<[^>]*>//g' | grep -v '^$' | paste -sd ',' -)
+    if [ -n "$XNAMES" ]; then
+      echo "  [WARN] XML CWP    : $GRAM.xml?-dbnames lists file names WITHOUT login (HTTP $XCODE): $XNAMES"
+      echo "         -> disable XML Web Publishing if unused (Admin Console > Connectors > Web"
+      echo "            Publishing), otherwise remove fmxml from every privilege set that does not need it."
+    else
+      echo "  [WARN] XML CWP    : $GRAM.xml reachable (HTTP $XCODE), no file names returned"
+      echo "         -> review & disable if unused (CVE-2026-86934)"
+    fi
+  done
+  [ "$XML_ANY" = "0" ] && echo "  [OK]   XML CWP    : not reachable (fmresultset.xml and FMPXMLRESULT.xml)"
 
   # Admin Console runs on 443 at /admin-console/ AND (historically) on :16000.
   # Blocking the port does NOT block the 443 path - check both. A 404 means
