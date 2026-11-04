@@ -23,9 +23,14 @@ WebDirect / OData / Data API) with unpatched servers.
   answers without credentials, it also lists the exposed entity sets and
   probes one of them for a single row, to show whether actual records — not
   just the schema — are readable.
+- **WebDirect guest enumeration.** Sends the same `POST /fmi/webd?api=login_list`
+  that the "Sign In as Guest" button triggers. If the server returns the
+  home-page listing without credentials, the hosted file names are exposed
+  pre-auth, and the script prints them.
 - **Interface exposure.** Reports whether OData, XML Custom Web Publishing,
-  WebDirect, and the Admin Console (port 16000) answer from where the script
-  is run.
+  WebDirect, and the Admin Console answer from where the script is run. The
+  Admin Console is checked both at `/admin-console/` on 443 and on port 16000 —
+  blocking the port does not block the 443 path.
 - **TLS certificate expiry.** Flags certs expiring within 30 days.
 
 ## What it does NOT do
@@ -76,6 +81,15 @@ to the line minimum above and confirm backport status with Claris.
 Run this only against servers you own or are explicitly authorized to test.
 Pointing it at third-party hosts sends unsolicited login attempts and may be
 treated as unauthorized access.
+
+## Changelog
+
+- **1.5.0** (2026-11-04) — WebDirect guest enumeration via `POST ?api=login_list`.
+- **1.4.0** (2026-11-04) — Admin Console checked on 443 `/admin-console/` and :16000.
+- **1.3.0** (2026-10-26) — OData entity-set capture and one-row probe; clearer version-withheld message.
+- **1.2.0** (2026-10-26) — Interactive mode (one host at a time).
+- **1.1.0** (2026-10-26) — Data API inventory and guest checks (Data API & OData).
+- **1.0.0** (2026-10-26) — Version/patch-level check, interface exposure, TLS expiry.
 
 ## License
 
