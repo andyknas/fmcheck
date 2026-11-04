@@ -1,21 +1,17 @@
 #!/bin/bash
 #
-# fmcheck.sh - read-only FileMaker Server exposure & patch-level auditor
+# fmcheck.sh v1.5.0 - read-only FileMaker Server exposure & patch-level auditor
+# NRG Software, LLC
 #
 # Per host it checks:
 #   - Running FileMaker Server version (unauthenticated Data API productInfo)
 #     vs the minimum patched release for its version line.
 #   - Database INVENTORY exposed over the Data API (fmrest privilege).
-#     NOTE: the "filter databases" Admin Console setting does NOT reliably
-#     hide this list - the check calls the endpoint and judges by the reply.
-#   - WebDirect launch center (/fmi/webd): must show a sign-in page, not a
-#     list of hosted file names. Fix is the server-level "Filter Databases in
-#     Client Applications" setting - there is no WebDirect-specific setting.
 #   - GUEST / anonymous access per file, over the Data API AND OData.
-#   - XML CWP -dbnames in both grammars (fmresultset.xml, FMPXMLRESULT.xml):
-#     flags any file names returned without login.
-#   - Which FileMaker web interfaces answer publicly (OData, XML CWP,
-#     WebDirect, Admin Console :16000).
+#   - WebDirect: whether an anonymous "Sign In as Guest" (POST ?api=login_list)
+#     returns the hosted-file list, and the file names if it does.
+#   - Which other web interfaces answer publicly (OData, XML CWP, Admin
+#     Console on 443 and :16000).
 #   - TLS certificate expiry.
 #
 # DEFENSIVE ONLY, on hosts YOU own: every request hits a metadata/version
@@ -36,6 +32,17 @@
 #   NOTE: the Sep-2026 fixes are only *confirmed* in 26.0.3. On 22.x/21.x/20.x,
 #   patch to the line minimum below AND confirm backport status with Claris.
 #
+# Changelog:
+#   1.5.0 (2026-11-04) - WebDirect guest enumeration via POST ?api=login_list.
+#   1.4.0 (2026-11-04) - Admin Console checked on 443 /admin-console/ AND :16000
+#                        (blocking the port does not block the 443 path).
+#   1.3.0 (2026-10-26) - OData: capture exposed entity sets + one-row probe to
+#                        show whether records (not just schema) are readable;
+#                        clearer "version withheld" vs "not reachable" message.
+#   1.2.0 (2026-10-26) - Interactive mode: prompt for one host at a time.
+#   1.1.0 (2026-10-26) - Data API inventory + guest checks (Data API & OData).
+#   1.0.0 (2026-10-26) - Version/patch-level check, interface exposure, TLS.
+#
 # Usage:
 #   ./fmcheck.sh                     # interactive: prompts for one host at a time
 #   ./fmcheck.sh hosts.txt           # one hostname per line in hosts.txt
@@ -43,8 +50,9 @@
 #   ./fmcheck.sh --help
 #
 # hosts.txt: one host per line; blank lines and #comments ignored.
-# Hostname only, no scheme, e.g.   fms.example.com
+# Hostname only, no scheme, e.g.   fms.redwallprints.com
 
+VERSION="1.5.0"
 TIMEOUT=10
 ADMIN_PORT=16000
 TMP="${TMPDIR:-/tmp}/fmcheck.$$"
@@ -138,11 +146,7 @@ audit_host() {
     echo "  [OK]   Data API   : no files exposed over REST (or Data API off)"
   else
     N=$(echo "$DBS" | grep -c .)
-    echo "  [WARN] Data API   : $N file name(s) listed WITHOUT login at /fmi/data/vLatest/databases:"
-    echo "         -> attackers use this list to pick login targets; the filter-databases"
-    echo "            setting does not hide it. Disable the FileMaker Data API if unused"
-    echo "            (Admin Console > Connectors > FileMaker Data API); otherwise remove"
-    echo "            fmrest from every privilege set that does not need it."
+    echo "  [INFO] Data API   : $N file(s) exposed over REST:"
     OLDIFS="$IFS"; IFS='
 '
     for DB in $DBS; do
@@ -212,8 +216,6 @@ audit_host() {
     CATS=$(grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+"' "$TMP" \
            | sed -E 's/.*:[[:space:]]*"([^"]+)".*/\1/' | head -8 | paste -sd ',' -)
     echo "  [WARN] OData      : root returned a catalog WITHOUT creds (HTTP 200): ${CATS:-see body}"
-    echo "         -> disable OData if unused (Admin Console > Connectors > OData), otherwise"
-    echo "            remove fmodata from every privilege set that does not need it."
   elif reachable "$OROOT"; then
     echo "  [INFO] OData      : service root reachable (HTTP $OROOT)"
   else
@@ -221,46 +223,32 @@ audit_host() {
   fi
 
   # --- Other interfaces ---
-  C_WEBD=$(curl -skL -o "$TMP" -w '%{http_code}' --max-time "$TIMEOUT" "https://$H/fmi/webd/" 2>/dev/null)
-  # Unfiltered launch center draws each hosted file with the iwp_db icon or a
-  # getthumb thumbnail; the sign-in-first page has neither.
-  WD_FILES=$(grep -oE 'iwp_db@[0-9]x\.png|fms-command=getthumb' "$TMP" 2>/dev/null | grep -c .)
-  grep -q 'Client must provide account information' "$TMP" 2>/dev/null && WD_LOGIN=1 || WD_LOGIN=0
+  C_XML=$(code_get "https://$H/fmi/xml/fmresultset.xml?-dbnames")
   C_ADMIN443=$(code_get "https://$H/admin-console/")
   C_ADMIN16=$(code_get "https://$H:$ADMIN_PORT/admin-console/")
 
-  if ! reachable "$C_WEBD"; then
-    echo "  [OK]   WebDirect  : not reachable"
-  elif [ "$WD_FILES" -gt 0 ]; then
-    echo "  [WARN] WebDirect  : /fmi/webd lists hosted files WITHOUT login (~$WD_FILES file icon(s))"
-    echo "         -> fix: enable \"Filter Databases in Client Applications\" in the Admin Console"
-    echo "            (a server setting, not a WebDirect setting); /fmi/webd then shows sign-in first"
-  elif [ "$WD_LOGIN" = "1" ]; then
-    echo "  [OK]   WebDirect  : /fmi/webd shows sign-in page, no file names (HTTP $C_WEBD)"
+  # --- WebDirect: does an anonymous "Sign In as Guest" return the file list? ---
+  # The guest button POSTs /fmi/webd?api=login_list; a result:"0" response
+  # carries the home-page HTML enumerating the hosted WebDirect files. The
+  # names appear in the thumbnail URLs as /docws/<Name>?fms-command=getthumb.
+  WCODE=$(code_get "https://$H/fmi/webd/")
+  WBODY=$(curl -sk --max-time "$TIMEOUT" -X POST "https://$H/fmi/webd?api=login_list" 2>/dev/null)
+  if echo "$WBODY" | grep -q '"result"[[:space:]]*:[[:space:]]*"0"'; then
+    WDBS=$(echo "$WBODY" | grep -oE '/docws/[^?"]+\?fms-command=getthumb' \
+           | sed -E 's#/docws/([^?]+)\?.*#\1#' | sort -u | paste -sd ',' -)
+    [ -z "$WDBS" ] && WDBS="(result:0 but no names parsed)"
+    echo "  [WARN] WebDirect  : guest sign-in returns the file list WITHOUT creds: $WDBS"
+  elif reachable "$WCODE"; then
+    echo "  [OK]   WebDirect  : reachable (HTTP $WCODE) - guest list not returned"
   else
-    echo "  [INFO] WebDirect  : reachable (HTTP $C_WEBD) - page not recognised, check in a browser"
+    echo "  [OK]   WebDirect  : not reachable"
   fi
 
-  # XML Custom Web Publishing: try -dbnames in BOTH grammars and read the reply.
-  # fmresultset.xml returns names in <data>, FMPXMLRESULT.xml in <DATA>.
-  XML_ANY=0
-  for GRAM in fmresultset FMPXMLRESULT; do
-    XURL="https://$H/fmi/xml/$GRAM.xml?-dbnames"
-    XCODE=$(curl -sk -o "$TMP" -w '%{http_code}' --max-time "$TIMEOUT" "$XURL" 2>/dev/null)
-    reachable "$XCODE" || continue
-    XML_ANY=1
-    XNAMES=$(grep -oiE '<data>[^<]*</data>' "$TMP" 2>/dev/null \
-             | sed -E 's/<[^>]*>//g' | grep -v '^$' | paste -sd ',' -)
-    if [ -n "$XNAMES" ]; then
-      echo "  [WARN] XML CWP    : $GRAM.xml?-dbnames lists file names WITHOUT login (HTTP $XCODE): $XNAMES"
-      echo "         -> disable XML Web Publishing if unused (Admin Console > Connectors > Web"
-      echo "            Publishing), otherwise remove fmxml from every privilege set that does not need it."
-    else
-      echo "  [WARN] XML CWP    : $GRAM.xml reachable (HTTP $XCODE), no file names returned"
-      echo "         -> review & disable if unused (CVE-2026-86934)"
-    fi
-  done
-  [ "$XML_ANY" = "0" ] && echo "  [OK]   XML CWP    : not reachable (fmresultset.xml and FMPXMLRESULT.xml)"
+  if reachable "$C_XML"; then
+    echo "  [WARN] XML CWP    : reachable (HTTP $C_XML) - review & disable if unused (CVE-2026-86934)"
+  else
+    echo "  [OK]   XML CWP    : not reachable"
+  fi
 
   # Admin Console runs on 443 at /admin-console/ AND (historically) on :16000.
   # Blocking the port does NOT block the 443 path - check both. A 404 means
@@ -297,7 +285,7 @@ footer() {
   echo "are not visible here - see the checklist."
 }
 
-echo "FileMaker host audit  -  $(date '+%Y-%m-%d %H:%M:%S')"
+echo "FileMaker host audit  v$VERSION  -  $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================================"
 
 # --- Mode selection ---
